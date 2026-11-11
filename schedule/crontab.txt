@@ -1,0 +1,6 @@
+# If the review app and pipeline live on one box, a plain cron entry is enough.
+# Runs daily at 6:00 AM; flock stops overlapping runs.
+0 6 * * * cd /opt/bellhaven-sync && flock -n /tmp/bellhaven-sync.lock .venv/bin/python pipeline.py >> logs/pipeline.log 2>&1
+
+# Windows equivalent (Task Scheduler), run once from the project folder:
+# schtasks /Create /SC DAILY /ST 06:00 /TN "Bellhaven Sync" /TR "\"%CD%\run_pipeline.bat\""
