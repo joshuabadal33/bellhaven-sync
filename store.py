@@ -62,6 +62,9 @@ def sync_proposals(conn, proposals):
 
     new = 0
     for p in fresh:
+        # Still-open items get this run's evidence and write-time checks.
+        conn.execute("UPDATE proposals SET title=?, confidence=?, body=? WHERE key=? AND status IN ('pending','failed')",
+                     (p["title"], p["confidence"], json.dumps(p), p["key"]))
         cur = conn.execute(
             """INSERT OR IGNORE INTO proposals
                (key, kind, title, account_id, location_slug, confidence, body, created_at)

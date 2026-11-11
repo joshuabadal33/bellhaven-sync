@@ -15,10 +15,25 @@ from matcher import Matcher
 from scraper import scrape
 
 
+class IncompleteScrape(Exception):
+    pass
+
+
+def _check_complete(conn, locations):
+    """A half-broken scrape would make real communities look 'gone from the website'.
+    Stop before queuing anything if we got far fewer than last time."""
+    last = store.last_run(conn)
+    expected = (last or {}).get("locations") or 0
+    if not locations or len(locations) < 0.9 * expected:
+        raise IncompleteScrape(f"Scraped {len(locations)} communities, last run had {expected}. "
+                               "Nothing was queued; check the website/scraper.")
+
+
 def run(crm=None, locations=None, conn=None):
     crm = crm or CRM()
     conn = conn or store.connect()
     locations = locations if locations is not None else scrape()
+    _check_complete(conn, locations)
 
     accounts, contacts = crm.accounts(), crm.contacts()
     proposals, matches = Matcher(accounts, contacts).run(locations)

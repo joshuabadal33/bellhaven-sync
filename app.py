@@ -7,7 +7,7 @@ from flask import Flask, redirect, render_template, request, url_for
 
 import config
 import store
-from apply import apply
+from apply import BlockedError, apply
 from crm import CRM, CRMError
 
 app = Flask(__name__)
@@ -53,7 +53,7 @@ def decide(key):
         try:
             result = apply(CRM(), proposal["body"])
             store.mark(conn, key, "approved", note, result)
-        except CRMError as exc:
+        except (CRMError, BlockedError) as exc:
             store.mark(conn, key, "failed", note, str(exc))
     return redirect(url_for("index", kind=request.args.get("kind")) + f"#{request.form.get('next', '')}")
 

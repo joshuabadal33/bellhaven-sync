@@ -122,6 +122,12 @@ def _account_view(acct, parents):
     }
 
 
+def expected(acct):
+    """What the account looked like when the proposal was built. apply.py refuses
+    to write if it has changed since, so an old approval can't act on new data."""
+    return {"parent_id": acct.get("parent_id") or ""}
+
+
 def new_account_fields(loc, parent_id):
     return {
         "name": loc["name"],
@@ -167,23 +173,34 @@ class Matcher:
         admin = (loc.get("administrator") or "").lower()
         return bool(admin) and any(c["name"].lower() == admin for c in self.contacts_by_account.get(acct["account_id"], []))
 
-    def _survivor_score(self, acct, loc):
-        """Which of several CRM records at one address should survive."""
-        score = 0
-        if acct.get("parent_id") == self.operator_id:
-            score += 100
-        if self._admin_on_account(acct, loc):
-            score += 50
-        if acct.get("phone") and acct.get("phone") == loc.get("phone"):
-            score += 20
-        if norm_name(acct["name"]) == norm_name(loc["name"]):
-            score += 20
-        if acct.get("parent_id"):
-            score += 5  # an owned record beats an orphan
-        if acct.get("status") == "Active":
-            score += 2
-        score += len(self.contacts_by_account.get(acct["account_id"], []))
-        return score
+    def _survivor_rank(self, acct, loc):
+        """Which of several CRM records at one address should survive.
+
+        Strict priority, compared left to right: already under Bellhaven, has the
+        website's administrator as a contact, phone matches, exact name, exact
+        street spelling, has any parent, Active, number of contacts. Ties are
+        broken by account id so the pick never depends on API ordering.
+        """
+        return (
+            acct.get("parent_id") == self.operator_id,
+            self._admin_on_account(acct, loc),
+            bool(acct.get("phone")) and acct.get("phone") == loc.get("phone"),
+            norm_name(acct["name"]) == norm_name(loc["name"]),
+            (acct.get("billing_street") or "").strip().lower() == loc["street"].strip().lower(),
+            bool(acct.get("parent_id")),
+            acct.get("status") == "Active",
+            len(self.contacts_by_account.get(acct["account_id"], [])),
+        )
+
+    def _pick_survivor(self, candidates, loc):
+        ranked = sorted(candidates, key=lambda a: a["account_id"])               # tie-break: lowest id
+        ranked.sort(key=lambda a: self._survivor_rank(a, loc), reverse=True)    # stable sort keeps it
+        return ranked[0], ranked[1:]
+
+    def _clear_winner(self, acct, loc):
+        """A survivor backed by real evidence, not just a tie-break."""
+        rank = self._survivor_rank(acct, loc)
+        return rank[0] or rank[1]
 
     def _evidence_for(self, acct, loc, how):
         ev = [how]
@@ -214,11 +231,10 @@ class Matcher:
                 proposals += self._unmatched_location(loc)
                 continue
 
-            candidates.sort(key=lambda a: self._survivor_score(a, loc), reverse=True)
-            survivor, losers = candidates[0], candidates[1:]
+            survivor, losers = self._pick_survivor(candidates, loc)
             matched_ids.update(a["account_id"] for a in candidates)
 
-            clear_winner = self._survivor_score(survivor, loc) >= 100
+            clear_winner = self._clear_winner(survivor, loc)
             for loser in losers:
                 proposals.append(self._duplicate(loser, survivor, loc, clear_winner))
 
@@ -236,10 +252,10 @@ class Matcher:
     def _fix_existing(self, acct, loc, how, contested):
         evidence = self._evidence_for(acct, loc, how)
         site, crm = _site_view(loc), _account_view(acct, self.parent_names)
-        confidence = "medium" if contested and self._survivor_score(acct, loc) < 100 else "high"
+        confidence = "medium" if contested and not self._clear_winner(acct, loc) else "high"
         if contested:
             evidence.append("Several CRM accounts share this address; this one was chosen to survive "
-                            "(operator parent > administrator contact > phone > exact name)")
+                            "(Bellhaven parent > administrator contact > phone > exact name > exact street)")
 
         if acct.get("parent_id") != self.operator_id and must_preserve(acct):
             # SOP: do not touch the old account. New account under Bellhaven, old one points to it.
@@ -252,6 +268,7 @@ class Matcher:
                 "location_slug": loc["slug"],
                 "confidence": confidence,
                 "payload": payload,
+                "expected": expected(acct),
                 "evidence": evidence + [
                     f"Currently under {crm['parent']}; website shows it as a Bellhaven community",
                     f"Billing SOP: lifetime revenue ${crm['lifetime_revenue']:,} and outstanding AR "
@@ -297,6 +314,7 @@ class Matcher:
             "location_slug": loc["slug"],
             "confidence": confidence,
             "payload": {"changes": changes, "note": "Synced to Bellhaven website: " + "; ".join(reasons)},
+            "expected": expected(acct),
             "evidence": evidence + ["Change: " + "; ".join(reasons)],
             "site": site, "crm": crm,
         }
@@ -311,7 +329,8 @@ class Matcher:
             evidence.append("None of the records is under Bellhaven or has the website's administrator as a "
                             "contact, so the survivor pick is a tie-break. Approve these together.")
         if must_preserve(loser):
-            evidence.append("Warning: this record has revenue and open AR. Check with billing before approving.")
+            evidence.append("Billing SOP: this record has revenue and open AR, so approving is blocked until "
+                            "billing clears the AR. It stays in the queue until then.")
         moved = self.contacts_by_account.get(loser["account_id"], [])
         if moved:
             evidence.append("Has contacts that should be moved to the survivor by hand: "
@@ -325,6 +344,7 @@ class Matcher:
             "confidence": "high" if clear_winner else "medium",
             "payload": {**payload, "note": f"Duplicate of {survivor['account_id']} ({survivor['name']}), "
                                            f"same address as Bellhaven website listing"},
+            "expected": expected(loser),
             "evidence": evidence,
             "site": _site_view(loc), "crm": _account_view(loser, self.parent_names),
         }
@@ -361,8 +381,12 @@ class Matcher:
                     "location_slug": loc["slug"],
                     "confidence": "low",
                     "payload": {**payload, "note": f"Linked to Bellhaven website listing {loc['name']}"},
+                    "expected": expected(acct),
                     "evidence": [
                         "Similar name in the same city, but a different street address",
+                        *(["Billing SOP: this account has revenue and open AR, so approving is blocked; "
+                           "if it is the same facility it needs a change of ownership instead"]
+                          if must_preserve(acct) else []),
                         f"Approving treats this account as {loc['name']} and moves it under Bellhaven. "
                         "Reject if they are different facilities (then approve the 'New account' proposal).",
                     ],
@@ -394,6 +418,7 @@ class Matcher:
                     "location_slug": "",
                     "confidence": "high",
                     "payload": payload,
+                    "expected": expected(acct),
                     "evidence": [
                         "Not listed on the Bellhaven website",
                         f"{successor['name']} ({successor['account_id']}) is at the same address under "
@@ -418,6 +443,7 @@ class Matcher:
                 "location_slug": "",
                 "confidence": "medium",
                 "payload": payload,
+                "expected": expected(acct),
                 "evidence": [
                     "Under the Bellhaven parent in the CRM but not on the Bellhaven website",
                     "We can't tell from the website whether it closed or was sold, so it is flagged "

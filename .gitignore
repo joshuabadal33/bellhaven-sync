@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 logs/
 last_run.json
+sync_state.db
