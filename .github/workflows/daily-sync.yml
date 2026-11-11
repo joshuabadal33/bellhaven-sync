@@ -1,36 +1,29 @@
-# Daily run of the pipeline. Not live; this is the config I'd use.
+# Daily check in GitHub Actions: runs the tests every day and on every push.
 #
-# The pipeline only queues proposals, it never writes to the CRM, so running it
-# unattended is safe. Review state (sync_state.db) is committed back to the
-# repo so the next run knows what was already approved or rejected.
-name: daily-sync
+# The pipeline itself runs on the machine that hosts the review app (see
+# schedule/crontab.txt), because both need the same sync_state.db: that file is
+# what remembers approvals and rejections. It holds CRM data, so it is never
+# committed to this public repo (.gitignore). In production I'd move that state
+# to a private shared database and run the pipeline from here too.
+name: daily-check
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # 12:00 UTC = early morning US time, before reviewers start
+    - cron: "0 12 * * *"   # 12:00 UTC, before reviewers start
+  push:
   workflow_dispatch: {}
 
-concurrency: daily-sync   # never two runs at once
+concurrency: daily-check
 
 jobs:
-  sync:
+  test:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python -m unittest discover tests
-      - run: python pipeline.py
-        env:
-          BELLHAVEN_TOKEN: ${{ secrets.BELLHAVEN_TOKEN }}
-      - name: Save review state
-        run: |
-          git config user.name "bellhaven-sync"
-          git config user.email "bellhaven-sync@users.noreply.github.com"
-          git add sync_state.db
-          git diff --cached --quiet || git commit -m "sync state $(date -u +%F)"
-          git push
+      - run: python -m unittest discover tests -v
