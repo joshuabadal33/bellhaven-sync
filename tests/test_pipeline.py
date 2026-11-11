@@ -17,9 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config  # noqa: E402
 import store  # noqa: E402
-from apply import apply  # noqa: E402
+from apply import BlockedError, apply  # noqa: E402
 from matcher import Matcher, norm_name, norm_street  # noqa: E402
-from pipeline import run  # noqa: E402
+from pipeline import IncompleteScrape, run  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BH = "0015QAPLGS3FVYEEEM"
@@ -149,6 +149,82 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(self.kinds("0016PVXH4B25HWR7QE"), ["needs_review"])   # Coldwater
 
 
+class WriteSafetyTests(unittest.TestCase):
+    """The approve path re-checks the CRM before writing. These are the failure
+    cases: stale approvals, billing-protected accounts, half-finished writes."""
+
+    def proposal(self, crm, kind, account_id=None, slug=None):
+        proposals, _ = Matcher(crm.accounts(), crm.contacts()).run(locations_fixture())
+        return next(p for p in proposals if p["kind"] == kind
+                    and (account_id is None or p["account_id"] == account_id)
+                    and (slug is None or p["location_slug"] == slug))
+
+    def test_survivor_does_not_depend_on_api_order(self):
+        kettering = next(l for l in locations_fixture() if l["slug"] == "bellhaven-of-kettering")
+        for accounts in (accounts_fixture(), accounts_fixture()[::-1]):
+            m = Matcher(accounts, contacts_fixture())
+            survivor, _ = m._pick_survivor(m.find_candidates(kettering)[0], kettering)
+            self.assertEqual(survivor["account_id"], "001WR41PYNWXCAE2X4")   # Harborview copy, exact street
+
+    def test_possible_match_cannot_skip_the_sop(self):
+        crm = FakeCRM()
+        crm.rows["001GNU41AVXZRLLJ9P"].update(lifetime_revenue=9000.0, outstanding_ar=800.0)
+        with self.assertRaises(BlockedError):
+            apply(crm, self.proposal(crm, "possible_match"))
+        self.assertEqual(crm.rows["001GNU41AVXZRLLJ9P"]["parent_id"], "001DAAUWV2J3SHQJ34")
+
+    def test_duplicate_with_open_ar_is_not_deactivated(self):
+        crm = FakeCRM()
+        p = self.proposal(crm, "duplicate", "001JD2MWRA74LTSN24")
+        crm.rows["001JD2MWRA74LTSN24"].update(lifetime_revenue=5000.0, outstanding_ar=300.0)
+        with self.assertRaises(BlockedError):
+            apply(crm, p)
+        self.assertEqual(crm.rows["001JD2MWRA74LTSN24"]["status"], "Active")
+
+    def test_ar_added_after_proposal_blocks_direct_reparent(self):
+        crm = FakeCRM()
+        lima = self.proposal(crm, "update", "001LGFPBJY4N9MB6KL")          # proposed when AR was 0
+        crm.rows["001LGFPBJY4N9MB6KL"]["outstanding_ar"] = 1200.0           # billing posts AR before approval
+        with self.assertRaises(BlockedError):
+            apply(crm, lima)
+        self.assertEqual(crm.rows["001LGFPBJY4N9MB6KL"]["parent_id"], "001FJZYHR7MLFMNPLL")
+
+    def test_account_changed_since_proposal_is_not_written(self):
+        crm = FakeCRM()
+        p = self.proposal(crm, "update", "001LGFPBJY4N9MB6KL")
+        crm.rows["001LGFPBJY4N9MB6KL"]["parent_id"] = "001YRHHXQ5HJ0TCL2U"  # someone moved it meanwhile
+        with self.assertRaises(BlockedError):
+            apply(crm, p)
+
+    def test_chow_retry_after_partial_failure_creates_one_account(self):
+        crm = FakeCRM()
+        p = self.proposal(crm, "chow_new", "001U6RW32TY0WSXZZB")           # Tiffin
+        real_update, calls = crm.update_account, {"n": 0}
+
+        def flaky(account_id, fields):                                     # API dies on the second step once
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("timeout")
+            return real_update(account_id, fields)
+
+        crm.update_account = flaky
+        with self.assertRaises(RuntimeError):
+            apply(crm, p)
+        apply(crm, p)                                                      # reviewer clicks Approve again
+        apply(crm, p)                                                      # and once more, by accident
+
+        tiffins = [a for a in crm.rows.values() if a["name"] == "Bellhaven of Tiffin" and a["parent_id"] == BH]
+        self.assertEqual(len(tiffins), 1)
+        self.assertEqual(crm.rows["001U6RW32TY0WSXZZB"]["chow_current_account"], tiffins[0]["account_id"])
+
+    def test_create_is_not_repeated(self):
+        crm = FakeCRM()
+        p = self.proposal(crm, "create", slug="bellhaven-of-batavia")
+        apply(crm, p)
+        apply(crm, p)
+        self.assertEqual(sum(a["name"] == "Bellhaven of Batavia" for a in crm.rows.values()), 1)
+
+
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
         # Keep test runs from overwriting the real last_run.json in the project folder.
@@ -174,6 +250,14 @@ class EndToEndTests(unittest.TestCase):
         stats, _, _ = run(crm, locations, conn)
         self.assertEqual(stats["new"], 0)
         self.assertNotIn(union["key"], [i["key"] for i in store.pending(conn)])
+
+    def test_incomplete_scrape_queues_nothing(self):
+        crm, conn, locations = FakeCRM(), self._conn(), locations_fixture()
+        run(crm, locations, conn)
+        before = len(store.pending(conn))
+        with self.assertRaises(IncompleteScrape):
+            run(crm, locations[:15], conn)                                  # website half-broken today
+        self.assertEqual(len(store.pending(conn)), before)
 
     def test_approve_all_then_rerun_is_quiet(self):
         crm, conn, locations = FakeCRM(), self._conn(), locations_fixture()
