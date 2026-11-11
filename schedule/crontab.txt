@@ -1,4 +1,5 @@
-# If the review app and pipeline live on one box, a plain cron entry is enough.
+# The pipeline runs on the same machine as the review app so both use one
+# sync_state.db (the record of approvals and rejections).
 # Runs daily at 6:00 AM; flock stops overlapping runs.
 0 6 * * * cd /opt/bellhaven-sync && flock -n /tmp/bellhaven-sync.lock .venv/bin/python pipeline.py >> logs/pipeline.log 2>&1
 
